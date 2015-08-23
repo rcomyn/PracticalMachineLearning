@@ -1,0 +1,366 @@
+---
+title: "Practical Machine Learning Project"
+author: "Robert Comyn"
+date: "Saturday, August 22, 2015"
+output: html_document
+---
+
+## Introduction
+The goal of this project is to use data from accelerometers on the belt, forearm, arm, and dumbbell of six participants to predict how well an activity was being performed by the wearer. Each participant was asked to perform one set of 10 repetitions of the Unilateral Dumbbell Biceps Curl in five different fashions (A through E).
+
+The training data and test data sets were provided from the course project web page.
+
+## Methods
+
+Environment in which the analysis was run.
+```{r}
+sessionInfo()
+```
+
+Load the required libraries.
+```{r message=FALSE, warning=FALSE}
+library(downloader)
+library(fields)
+library(caret)
+library(rpart)
+library(plyr)
+library(randomForest)
+library(partykit)
+library(C50)
+library(kernlab)
+library(dplyr)
+library(ggplot2)
+```
+
+### Data Collection
+
+A. Load the data
+
+Download the training and testing data files if they do not exist and save the date downloaded.
+```{r}
+trainingSaveFile <- "trainingData.rda"
+if (! file.exists(trainingSaveFile)) {
+    trainingDataFile <- "pml-training.csv"
+    # Download training data.
+    download("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv", 
+        destfile=trainingDataFile)
+    trainingDateDownloaded <- date()
+    # Read data file.
+    trainingData <- read.csv(trainingDataFile, na.strings=c("NA","#DIV/0!",""))
+    # Save as R-data file.
+    save(trainingData, trainingDateDownloaded, file=trainingSaveFile)
+    unlink(trainingDataFile)
+    rm(trainingDataFile)
+}
+testingSaveFile <- "testingData.rda"
+if (! file.exists(testingSaveFile)) {
+    testingDataFile <- "pml-test.csv"
+    # Download training data.
+    download("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv", 
+        destfile=testingDataFile)
+    testingDateDownloaded <- date()
+    # Read data file.
+    testingData <- read.csv(testingDataFile, na.strings=c("NA","#DIV/0!",""))
+    # Save as R-data file.
+    save(testingData, testingDateDownloaded, file=testingSaveFile)
+    unlink(testingDataFile)
+    rm(testingDataFile)
+}
+```
+    
+B. Load the training and testing data into memory if they have not been previously loaded.
+```{r}
+if (! exists("trainingData")) {
+    # Read R-data file.
+    load(trainingSaveFile)
+}
+if (! exists("testingData")) {
+    # Read R-data file.
+    load(testingSaveFile)    
+}
+```
+
+Dates data was downloaded.
+```{r}
+trainingDateDownloaded
+testingDateDownloaded
+```
+
+### Reproducibility
+This analysis is reproducible because seeds are set before any process that uses random sampling including the creation of the training/test sets and the training of each model.
+
+
+### Partition Training Data
+
+```{r}
+set.seed(123)
+inTrain <- createDataPartition(y=trainingData$classe, p=0.6, list=FALSE)
+
+training <- trainingData[inTrain,]
+testing <- trainingData[-inTrain,]
+```
+
+### Exploratory Analysis
+```{r}
+str(training)
+```
+
+Almost all of the rows have columns with missing values.
+```{r}
+sum(!complete.cases(trainingData))
+```
+
+### Preprocessing
+
+The following function preprocesses a data set by removing columns that are not predictors, removing columns with near zero variance, and removing columns with NAs or more than 60% missing values.
+```{r}
+preProcessData <- function(data) {
+    # Remove columns that are not predictors
+    data <- subset(data, select=-c(X, user_name, 
+                    raw_timestamp_part_1, raw_timestamp_part_2, 
+                    cvtd_timestamp, new_window, num_window))
+
+    # Remove columns with near zero variance
+    nzvCols <- nearZeroVar(data, saveMetrics = TRUE)
+    data <- data[, !nzvCols$nzv]   
+    
+    # Remove columns with NAs or more than 60% missing values
+    tmp <- t(stats(data))
+    naCols <- apply(tmp, 1, function(currow) {
+            all(is.na(currow)) || (currow["missing values"] > nrow(data) * 0.6)
+            #print(is.na(currow["mean"]))
+            #print(currow)
+         })
+    naCols[length(naCols)] <- FALSE # save classe
+    data <- data[!naCols]
+
+    return(data)
+}
+```
+
+Perform preprocessing on the training and testing portions of the Training Data.
+```{r}
+training <- preProcessData(training)
+testing <- preProcessData(testing)
+```
+
+Check for variables that have high correlation.
+```{r}
+M <- abs(cor(subset(training, select=-classe)))
+diag <- 0 # all variables are perfectly correlated with themselves
+nrow(which(M > 0.8, arr.ind=T))
+```
+Many rows have correlations > 0.8. We must use models that can handle data with high correlations between predictors (e.g, tree-based algorithms) or the data should be pre-processed with principal component analysis.
+
+
+## Modeling and Testing
+
+We chose to create and evaluate models with five different algoritms: RPART, C5.0 (a boosting algorithm in the same category as gbm), Random Forest (rf), Support Vector Machine (svmRadial), and Linear Discriminant Analysis (lda). These algorithms were evaluated with and without additional principal component analysis (pca) preprocessing using the caret package.
+
+After modeling, the following function accumulates results from modeling, performs prediction on the testing data, and creates a results table for all of the models.
+```{r}
+results <- NULL
+testingPredictions <- function(modelName, fit, results, testing) {
+    pred <- predict(fit, testing)
+    table(pred, testing$classe)
+    cm <- confusionMatrix(testing$classe, pred)
+    newRow <- as.data.frame(cbind(fit$results[1,], cm$overall["Accuracy"]))
+    if (modelName == "rpart" || modelName == "rpartPC") {
+        newRow$cp <- NULL
+    }
+    if (modelName == "C5.0" || modelName == "C5.0PC") {
+        newRow$model <- NULL
+        newRow$winnow <- NULL
+        newRow$trials <- NULL
+    }
+    if (modelName == "rf" || modelName == "rfPC") {
+        newRow$mtry <- NULL
+    }
+    if (modelName == "svmRadial" || modelName == "svmRadialPC") {
+        newRow[,1] <- NULL
+        newRow[,1] <- NULL
+    }
+    if (modelName == "lda" || modelName == "ldaPC") {
+        newRow[,1] <- NULL
+    }
+    names(newRow)[1:5] <- c("Accuracy", "Kappa", "AccuracySD", "KappaSD", "Test Accuracy")
+    rownames(newRow) <- modelName
+    results <- rbind(results, newRow)
+    results
+}
+```
+
+Enable parallel processing.
+```{r eval=FALSE, warning=FALSE}
+library(doParallel)
+registerDoParallel(cores=4)
+```
+
+### RPART
+```{r eval=FALSE, warning=FALSE}
+fitControl <- trainControl(method = "repeatedcv", number = 10, repeats = 10)
+
+set.seed(123)
+rpartFit <- train(classe ~ ., data = training, method = "rpart",
+    tuneLength = 30,
+    trControl = fitControl)
+
+set.seed(123)
+rpartFitPC <- train(classe ~ ., data = training, preProcess="pca", method = "rpart",
+    tuneLength = 30,
+    trControl = fitControl)
+
+results <- testingPredictions("rpart", rpartFit, results, testing)
+results <- testingPredictions("rpartPC", rpartFitPC, results, testing)
+```
+
+
+### C5.0
+```{r eval=FALSE, warning=FALSE}
+fitControl <- trainControl(method = "repeatedcv", number = 10, repeats = 3)
+
+grid <- expand.grid(model = "tree", trials = c(1:100), winnow = FALSE)
+
+set.seed(123)
+C5.0Fit <- train(classe ~ ., data = training, method = "C5.0",
+    tuneGrid = grid,
+    trControl = fitControl)
+
+set.seed(123)
+C5.0FitPC <- train(classe ~ ., data = training, preProcess="pca", method = "C5.0",
+    tuneGrid = grid,
+    trControl = fitControl)
+
+results <- testingPredictions("C5.0", C5.0Fit, results, testing)
+results <- testingPredictions("C5.0PC", C5.0FitPC, results, testing)
+```
+
+
+### Random Forest
+```{r eval=FALSE, warning=FALSE}
+fitControl <- trainControl(method = "repeatedcv", number = 10, repeats = 3)
+
+set.seed(123)
+rfFit <- train(classe ~ ., data = training, method = "rf",
+    trControl = fitControl)
+
+set.seed(123)
+system.time(rfFitPC <- train(classe ~ ., data = training, preProcess="pca", method = "rf",
+    trControl = fitControl))
+
+results <- testingPredictions("rf", rfFit, results, testing)
+results <- testingPredictions("rfPC", rfFitPC, results, testing)
+```
+
+### Support Vector Machines
+```{r eval=FALSE, warning=FALSE}
+fitControl <- trainControl(method = "repeatedcv", number = 10, repeats = 3)
+
+set.seed(123)
+system.time(svmFit <- train(classe ~ ., data = training, method = "svmRadial",
+    tuneLength = 9,
+    trControl = fitControl))
+
+set.seed(123)
+system.time(svmFitPC <- train(classe ~ ., data = training, preProcess="pca", method = "svmRadial",
+    tuneLength = 9,
+    trControl = fitControl))
+
+results <- testingPredictions("svmRadial", svmFit, results, testing)
+results <- testingPredictions("svmRadialPC", svmFitPC, results, testing)
+```
+
+### Linear Discriminant Analysis
+```{r eval=FALSE, warning=FALSE}
+fitControl <- trainControl(method = "repeatedcv", number = 10, repeats = 10)
+
+set.seed(123)
+system.time(ldaFit <- train(classe ~ ., data = training, method = "lda",
+    trControl = fitControl))
+
+set.seed(123)
+system.time(ldaFitPC <- train(classe ~ ., data = training, preProcess="pca", method = "lda",
+    trControl = fitControl))
+
+results <- testingPredictions("lda", ldaFit, results, testing)
+results <- testingPredictions("ldaPC", ldaFitPC, results, testing)
+```
+
+## Results
+
+The table below shows the results of the ten models created. The first four data columns are data from the final model chosen by "train" and the Test Accuracy is from predictions made and the test set.
+```{r echo=FALSE}
+#Get the results saved to disk.
+load("resultsFile")
+```
+
+```{r}
+results
+```
+The model with the best combination of training and testing accuracy is the random forest model without PCA adn this model was chosen for final testing on the withheld testingData set.
+
+### Out of Sample Error
+
+Out of sample error for random forest model without PCA is (1 - Testing Accuracy) or
+```{r}
+osError <- sprintf("%1.3f", (1 - results[match("rf", rownames(results)),5]) * 100)
+print(paste0("Out of Error Sample is: ", osError, "%"))
+```
+
+### Variable Importance
+
+The twenty most important variables in the random forest without PCA model are:
+```{r}
+varImp(rfFit)
+```
+
+```{r echo=FALSE, fig.height=5.0, tidy=FALSE}
+featurePlot(x=training[,c("roll_belt","pitch_belt","yaw_belt","classe")], 
+            y=training$classe, plot="pairs",
+            main="Pairs Plot of Three Most Important Predictors vs Outcome")
+```
+
+Figure 1: Pairs plot showing the strong correlation between each of the top three most important predictors and the outcome variable (classe).
+
+### Final Testing on Withheld Testing Data
+
+First prepare the data the same way the trainingData was prepared.
+```{r}
+finalTesting <- preProcessData(testingData)
+```
+
+Make predictions.
+```{r}
+answers <- as.character(predict(rfFit, newdata=finalTesting))
+```
+
+Generate files to submit with code provided in assignment.
+```{r}
+pml_write_files = function(x){
+  n = length(x)
+  for(i in 1:n){
+    filename = paste0("answers/problem_id_",i,".txt")
+    write.table(x[i],file=filename,quote=FALSE,row.names=FALSE,col.names=FALSE)
+  }
+}
+pml_write_files(answers)
+```
+
+As expected with such a low out of sample error, all 20 predictions were correct.
+
+## Conclusions
+
+For this data set, the random forest algorithm without PCA provides a better than 99% prediction accuracy. C5.0 without PCA was a close second. The models created with principal component preprocessing (PCA) gave poorer results for each model than the models run without PCA.
+
+## References
+
+1. Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. Qualitative Activity Recognition of Weight Lifting Exercises. Proceedings of 4th International Conference in Cooperation with SIGCHI (Augmented Human '13) . Stuttgart, Germany: ACM SIGCHI, 2013.
+2. Coursera Practical Machine Learning Course Project.
+Training Data: https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv
+Test Data: https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv
+Accessesed: 8/15/2015
+3. R Core. "The R Project for Statistical Computing" URL: http://www.R-project.org.
+4. Adler, Joseph. R In A Nutshell. O'Reilly, 2010.
+5. Teetor, Paul. R Cookbook. O'Reilly, 2011.
+6. Chang, Winston. R Graphics Cookbook. O'Reilly, 2013.
+7. R Markdown Page. URL: http://www.rstudio.com/ide/docs/authoring/using_markdown. Accessed 8/5/2015.
